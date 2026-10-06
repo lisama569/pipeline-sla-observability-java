@@ -4,8 +4,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * SLA 评估配置（可通过 application.properties 覆盖）。
@@ -51,13 +51,15 @@ public class SlaProperties {
     /** 默认规则（未单独配置的流水线使用）。 */
     private PipelineRule defaultRule = new PipelineRule();
 
-    /** 按流水线的覆盖规则。 */
-    private Map<String, PipelineRule> pipelines = new HashMap<>();
+    /** 按流水线的覆盖规则（并发容器，支持在线更新与并发读取）。 */
+    private Map<String, PipelineRule> pipelines = new ConcurrentHashMap<>();
 
     public PipelineRule getDefaultRule() { return defaultRule; }
     public void setDefaultRule(PipelineRule defaultRule) { this.defaultRule = defaultRule; }
     public Map<String, PipelineRule> getPipelines() { return pipelines; }
-    public void setPipelines(Map<String, PipelineRule> pipelines) { this.pipelines = pipelines; }
+    public void setPipelines(Map<String, PipelineRule> pipelines) {
+        this.pipelines = new ConcurrentHashMap<>(pipelines);
+    }
     public Duration getRetention() { return retention; }
     public void setRetention(Duration retention) { this.retention = retention; }
     public boolean isRequireRegisteredPipelines() { return requireRegisteredPipelines; }

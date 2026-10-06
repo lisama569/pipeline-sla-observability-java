@@ -1,6 +1,9 @@
 package com.github.lisama569.pipelineslaobservabilityjava.service;
 
 import com.github.lisama569.pipelineslaobservabilityjava.config.SlaProperties;
+import com.github.lisama569.pipelineslaobservabilityjava.model.AckRejectReason;
+import com.github.lisama569.pipelineslaobservabilityjava.model.AckResult;
+import com.github.lisama569.pipelineslaobservabilityjava.model.AckStatus;
 import com.github.lisama569.pipelineslaobservabilityjava.model.Alert;
 import com.github.lisama569.pipelineslaobservabilityjava.model.AlertStatus;
 import com.github.lisama569.pipelineslaobservabilityjava.model.MetricType;
@@ -40,12 +43,19 @@ public class AlertManager {
     }
 
     private final SlaProperties properties;
+    private final MaintenanceService maintenance;
     private final Map<String, Alert> alertsById = new LinkedHashMap<>();
     private final Map<String, Map<MetricType, MetricState>> states = new LinkedHashMap<>();
     private long sequence;
 
     public AlertManager(SlaProperties properties) {
+        this(properties, new MaintenanceService());
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public AlertManager(SlaProperties properties, MaintenanceService maintenance) {
         this.properties = properties;
+        this.maintenance = maintenance;
     }
 
     /** 根据一次评估结论推进告警生命周期。 */
@@ -82,11 +92,15 @@ public class AlertManager {
         String key = a.pipelineId() + "|" + metric;
         Instant at = a.evaluatedAt();
 
-        if (breached) {
+        // 维护静默按事件时间判断：静默期内的违约不触发新告警、不升级、不计连续违约次数；
+        // 评估结论本身仍可从评估接口查询。恢复（带裕量）不受静默影响，照常生效。
+        boolean suppressed = maintenance.isSuppressed(a.pipelineId(), metric, at);
+
+        if (breached && !suppressed) {
             state.consecutiveBreaches++;
             if (state.openAlertId == null) {
                 String alertId = key + "|" + at + "|" + (++sequence);
-                alertsById.put(alertId, new Alert(alertId, a.pipelineId(), metric,
+                alertsById.put(alertId, Alert.unacked(alertId, a.pipelineId(), metric,
                         Severity.WARNING, AlertStatus.FIRING, at, null, 0,
                         "触发: " + evidence));
                 state.openAlertId = alertId;
@@ -94,22 +108,57 @@ public class AlertManager {
                 Alert open = alertsById.get(state.openAlertId);
                 if (open.severity() == Severity.WARNING
                         && state.consecutiveBreaches >= rule.getEscalateAfter()) {
-                    alertsById.put(open.alertId(), new Alert(open.alertId(), open.pipelineId(), open.metricType(),
-                            Severity.CRITICAL, AlertStatus.FIRING, open.firedAt(), null,
-                            open.escalationCount() + 1, "升级: 连续违约 " + state.consecutiveBreaches + " 次, " + evidence));
+                    alertsById.put(open.alertId(), open.with(Severity.CRITICAL, AlertStatus.FIRING, null,
+                            open.escalationCount() + 1,
+                            "升级: 连续违约 " + state.consecutiveBreaches + " 次, " + evidence));
                 }
             }
         } else if (recoveredWithMargin) {
             state.consecutiveBreaches = 0;
             if (state.openAlertId != null) {
                 Alert open = alertsById.get(state.openAlertId);
-                alertsById.put(open.alertId(), new Alert(open.alertId(), open.pipelineId(), open.metricType(),
-                        open.severity(), AlertStatus.RESOLVED, open.firedAt(), at,
+                alertsById.put(open.alertId(), open.with(open.severity(), AlertStatus.RESOLVED, at,
                         open.escalationCount(), "自动恢复: " + evidence));
                 state.openAlertId = null;
             }
         }
         // 既未违约也未带裕量恢复（阈值附近抖动或指标缺失）：保持现状，不计数不迁移。
+    }
+
+    /**
+     * 认领一条活动中的告警。
+     *
+     * <p>语义：重复认领幂等（返回既有快照，无副作用）；已恢复的告警明确拒绝
+     * （ALERT_ALREADY_RESOLVED，可与 ALERT_NOT_FOUND 区分）；认领信息随告警快照
+     * 一直保留到恢复，升级/恢复等后续迁移不会把它倒回去。
+     *
+     * @param at 认领时间（调用方传入，通常取事件时间水位线，保证可复现）
+     */
+    public synchronized AckResult ack(String alertId, String ackBy, String note, Instant at) {
+        if (ackBy == null || ackBy.isBlank()) {
+            return AckResult.rejected(AckRejectReason.MISSING_ACK_BY, "认领人缺失: alertId=" + alertId);
+        }
+        Alert alert = alertsById.get(alertId);
+        if (alert == null) {
+            return AckResult.rejected(AckRejectReason.ALERT_NOT_FOUND, "告警不存在: " + alertId);
+        }
+        if (alert.status() == AlertStatus.RESOLVED) {
+            return AckResult.rejected(AckRejectReason.ALERT_ALREADY_RESOLVED,
+                    "告警已恢复，不允许认领: " + alertId);
+        }
+        if (alert.acknowledgedBy() != null) {
+            return AckResult.of(AckStatus.DUPLICATE, alert,
+                    "告警已被 " + alert.acknowledgedBy() + " 认领，幂等忽略: " + alertId);
+        }
+        Alert acked = alert.withAck(ackBy, at, note);
+        alertsById.put(alertId, acked);
+        return AckResult.of(AckStatus.ACKNOWLEDGED, acked,
+                "已认领: " + alertId + " by=" + ackBy);
+    }
+
+    /** 按 alertId 查询告警快照。 */
+    public synchronized Alert findAlert(String alertId) {
+        return alertsById.get(alertId);
     }
 
     /** 当前处于 FIRING 的告警。 */

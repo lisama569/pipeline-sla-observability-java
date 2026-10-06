@@ -27,6 +27,71 @@ curl 'localhost:8080/api/alerts?includeResolved=true' # 含已恢复
 mvn test
 ```
 
+## 告警日常处置（维护静默 / 认领 / 在线改规则）
+
+三块能力都叠加在原有行为之上：没有维护窗口和认领参与时，告警的触发、去重、升级、
+恢复语义与之前完全一致；上报的幂等、乱序、时钟回拨、超期清理语义不变；
+多条流水线各自独立评估，互不影响。
+
+### 计划内维护 / 静默
+
+```bash
+# 声明维护窗口（metricType 省略 = 静默该流水线全部指标；窗口按事件时间 [start, end) 判断）
+curl -X POST localhost:8080/api/maintenance -H 'Content-Type: application/json' -d '{
+  "pipelineId":"orders","start":"2026-10-07T01:00:00Z","end":"2026-10-07T02:00:00Z",
+  "note":"计划换版"}'
+# 只静默单个指标：加上 "metricType":"SLA_ATTAINMENT"
+
+# 重复提交同一窗口 -> status=DUPLICATE，不会产生第二份记录（幂等键 = pipelineId|metric|start|end）
+# 查询 / 撤销
+curl 'localhost:8080/api/maintenance?pipelineId=orders'
+curl -X POST localhost:8080/api/maintenance/revoke -H 'Content-Type: application/json' -d '{
+  "pipelineId":"orders","start":"2026-10-07T01:00:00Z","end":"2026-10-07T02:00:00Z"}'
+```
+
+- 窗口内的违约：评估结论照常可从 `/api/pipelines/{id}/assessment` 查到，
+  但不新拉告警、不把已有告警往上升级、不计连续违约次数；带裕量恢复照常生效。
+- 窗口一过（按事件时间水位线判断，不用机器当前时间，重放结果一致），
+  指标仍在违约则照常形成新告警。
+- 声明与撤销可并发，不会互相覆盖或丢数据；非法入参返回 422，
+  原因可区分：`MISSING_FIELDS` / `INVALID_TIME_RANGE`。
+
+### 告警认领
+
+```bash
+# 先查出活动告警的 alertId
+curl 'localhost:8080/api/alerts'
+# 认领（带认领人与备注）；alertId 含 | 和 :，放进路径前需 URL 编码
+# （例：orders|SLA_ATTAINMENT|... -> orders%7CSLA_ATTAINMENT%7C...）
+curl -X POST localhost:8080/api/alerts/<alertId>/ack -H 'Content-Type: application/json' \
+  -d '{"ackBy":"lisa","note":"值班处理中"}'
+```
+
+- 认领后该告警继续违约不会新开告警，后续评估也不会把状态倒回去；
+  认领信息（`acknowledgedBy/acknowledgedAt/ackNote`）随告警快照保留到恢复（含升级过程）。
+- 恢复后再次违约 = 新的事故周期：生成全新 `alertId`，默认未认领。
+- 重复认领幂等：返回 `DUPLICATE` 与既有快照，不覆盖、不报错。
+- 已恢复的告警再认领返回 422 + `ALERT_ALREADY_RESOLVED`；
+  告警不存在返回 422 + `ALERT_NOT_FOUND`；缺认领人返回 422 + `MISSING_ACK_BY`，三种原因可区分。
+
+### 在线改规则
+
+```bash
+# 只改 orders 这条流水线的部分阈值（未携带的字段保持原值），立即生效、无需重启
+curl -X PUT localhost:8080/api/rules/orders -H 'Content-Type: application/json' -d '{
+  "window":"PT30M","maxFreshnessLag":"PT5M","minSlaAttainment":0.5}'
+# 查看当前生效规则
+curl localhost:8080/api/rules/orders
+```
+
+- 生效范围：后续评估与上报；已产生的告警快照不被追溯改写。
+- 原子生效：先整体校验，任一字段非法则整条拒绝（不会只改一半），
+  原因可区分：`INVALID_WINDOW`（窗口非正数）、`INVALID_FRESHNESS_LAG` /
+  `INVALID_SCHEDULE_DELAY`（阈值为负）、`INVALID_ATTAINMENT` / `INVALID_RECOVERY_MARGIN`
+  （跑出 [0,1]）、`INVALID_ESCALATE_AFTER`（小于 1）、`NO_FIELDS`、`MISSING_PIPELINE_ID`。
+- 同一规则下同一份事件的评估结论稳定一致；规则对象整体替换，
+  并发读取不会看到改了一半的规则。
+
 ## 事件语义
 
 事件（`JobRunEvent`）字段：`pipelineId`、`runId`、`eventType`(STARTED/FINISHED)、
@@ -94,6 +159,17 @@ sla.require-registered-pipelines=false  # 是否拒绝未注册流水线
 - `SlaEvaluatorTest`：同组事件不同顺序结论一致、阈值边界（=阈值不违约 / +1s 违约）、
   迟到事件改变结论且可追溯。
 - `AlertManagerTest`：阈值抖动不重复告警、连续违约升级、恢复后再违约开启新生命周期。
+- `MaintenanceServiceTest`：维护窗口声明幂等、按事件时间 [start,end) 静默、按指标静默、
+  撤销可区分、并发声明/撤销不产生重复记录。
+- `MaintenanceAlertTest`：窗口内不新拉不升级、窗口结束仍违约必触发新告警、
+  恢复不受静默影响、指标级静默不影响其它指标、撤销后立即恢复原有行为。
+- `AlertAckTest`：认领信息随快照保留到恢复、重复认领幂等、已恢复/不存在/缺认领人原因可区分、
+  新事故周期默认未认领。
+- `RuleUpdateServiceTest`：部分更新立即生效且不动其它字段、各类非法入参原因可区分、
+  校验失败整条不生效、已产生告警不被追溯改写、同规则同事件结论稳定。
+- `OperationsControllerTest`：三块能力的端到端 HTTP 链路（声明/撤销/认领/改规则/422 原因）。
+- `OperationsConcurrencyTest`：并发上报 + 评估 + 维护声明 + 认领，
+  断言不丢告警、不重复触发、状态不倒退、认领不丢不重。
 - `ConcurrencyTest`：8 上报线程 × 2 评估线程并发，断言接受/重复计数精确、
   alertId 唯一、每指标至多一个 FIRING、并发结论与顺序重放一致。
 - `ObservabilityControllerTest`：端到端 HTTP 上报/查询/422 拒绝原因。
